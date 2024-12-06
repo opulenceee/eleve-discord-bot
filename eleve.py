@@ -2,7 +2,7 @@ import os
 import json
 import discord
 from discord.ext import commands
-from discord import app_commands, Embed, Interaction
+from discord import app_commands, Embed, Interaction, ui
 from datetime import datetime
 from typing import Optional
 import pytz
@@ -36,6 +36,38 @@ intents.messages = True
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
+class DeleteJobButton(ui.View):
+    def __init__(self, job_id: int):
+        super().__init__()
+        self.job_id = job_id
+
+    @ui.button(label="Delete Job", style=discord.ButtonStyle.danger)
+    async def delete_job(self, interaction: Interaction, button: ui.Button):
+        # Check admin permissions
+        is_admin = await check_admin_role(interaction)
+        if not is_admin:
+            await interaction.response.send_message(
+                "You do not have permission to delete this job.", ephemeral=True
+            )
+            return
+
+        # Load jobs and remove the specific job
+        data = load_jobs()
+        job = next((job for job in data["jobs"] if job["id"] == self.job_id), None)
+        
+        if not job:
+            await interaction.response.send_message("Job not found.", ephemeral=True)
+            return
+
+        # Remove the job from the list
+        data["jobs"] = [j for j in data["jobs"] if j["id"] != self.job_id]
+        save_jobs(data)
+
+        # Delete the original message with the job embed
+        await interaction.message.delete()
+
+        # Confirm deletion
+        await interaction.response.send_message(f"Job {self.job_id} has been deleted.", ephemeral=True)
 
 # Helper Functions
 def load_jobs():
@@ -53,7 +85,8 @@ def save_jobs(data):
 
 
 def format_embed(job):
-    """Helper function to create an embed for a job."""
+    """Helper function to create an enhanced, more spaced-out embed for a job."""
+    # Format accepted, declined, and tentative users
     accepted_users = "No one yet" if not job["accepted"] else "\n".join(
         [f"<@{user}>" for user in job["accepted"]]
     )
@@ -65,16 +98,33 @@ def format_embed(job):
     )
 
     embed = Embed(
-        title="Scheduled Job",
-        color=int(EMBED_COLOR.lstrip('#'), 16),  # Remove the '#' and convert to int
-        description=f"**Time:** {job['time']}\n\n"
-                    f"**Location:** {job['location']}\n\n"
-                    f"**Details:** {job['details']}\n\n"
+        title="Job Scheduling",
+        color=int(EMBED_COLOR.lstrip('#'), 16),
     )
-    embed.add_field(name="✅ **Accepted**", value=f"({len(job['accepted'])})\n{accepted_users}", inline=True)
-    embed.add_field(name="❌ **Declined**", value=f"({len(job['declined'])})\n{declined_users}", inline=True)
-    embed.add_field(name="❓ **Tentative**", value=f"({len(job['tentative'])})\n{tentative_users}", inline=True)
-    embed.set_footer(text=f"Created by {job['created_by']}")
+    embed.add_field(name="Time", value=f"{job['time']}", inline=False)
+    embed.add_field(name="Location", value=f"{job['location']}", inline=False)
+    # Add reaction status fields with more spacing
+    embed.add_field(
+        name=f"✅ Accepted ({len(job['accepted'])})", 
+        value=f"\n{accepted_users}", 
+        inline=True
+    )
+    embed.add_field(
+        name=f"❌ Declined ({len(job['declined'])})", 
+        value=f"\n{declined_users}", 
+        inline=True
+    )
+    embed.add_field(
+        name=f"❓ Tentative ({len(job['tentative'])})", 
+        value=f"\n{tentative_users}", 
+        inline=True
+    )
+
+    # Enhanced footer with more information
+    embed.set_footer(
+        text=f"Created by {job['created_by']} | Job ID: {job['id']}"
+    )
+
     return embed
 
 
@@ -84,9 +134,6 @@ async def check_admin_role(interaction: Interaction):
     user_roles = [role.id for role in interaction.user.roles]
     has_admin_role = any(role_id in user_roles for role_id in ADMIN_ROLE_IDS)
     return is_owner or has_admin_role
-
-
-
 
 
 @bot.event
@@ -107,7 +154,7 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
     footer_text = embed.footer.text.split("Job ID: ")
     if len(footer_text) < 2:
         return  # Prevent errors if the footer doesn't contain the expected text format
-    job_id = int(footer_text[-1])  # Get the last part after "Job ID: "
+    job_id = int(footer_text[-1].split(" | ")[0])  # Get the job ID
     data = load_jobs()
 
     # Find the job
@@ -124,7 +171,18 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
         status = "tentative"
     else:
         return  # Ignore other reactions
-    
+
+    # Add the user's reaction to the appropriate list
+    if payload.user_id != bot.user.id:  # Don't allow the bot to react
+        if payload.user_id not in job[status]:
+            job[status].append(payload.user_id)
+            save_jobs(data)
+
+            # Update the embed with the new count using format_embed
+            new_embed = format_embed(job)
+            await message.edit(embed=new_embed)
+
+
 @bot.event
 async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
     """Handle reactions removed from job embed."""
@@ -143,7 +201,7 @@ async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
     footer_text = embed.footer.text.split("Job ID: ")
     if len(footer_text) < 2:
         return  # Prevent errors if the footer doesn't contain the expected text format
-    job_id = int(footer_text[-1])  # Get the last part after "Job ID: "
+    job_id = int(footer_text[-1].split(" | ")[0])  # Get the job ID
     data = load_jobs()
 
     # Find the job
@@ -167,20 +225,9 @@ async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
             job[status].remove(payload.user_id)
             save_jobs(data)
 
-            # Update the embed with the new count
+            # Update the embed with the new count using format_embed
             new_embed = format_embed(job)
             await message.edit(embed=new_embed)
-
-    # Add the user's reaction to the appropriate list
-    if payload.user_id != bot.user.id:  # Don't allow the bot to react
-        if payload.user_id not in job[status]:
-            job[status].append(payload.user_id)
-            save_jobs(data)
-
-            # Update the embed with the new count
-            new_embed = format_embed(job)
-            await message.edit(embed=new_embed)
-
 
 
 @bot.tree.command(name="createjob", description="Create a new job.")
@@ -236,8 +283,8 @@ async def createjob(
     # Use format_embed to create an embed
     embed = format_embed(job)
 
-    # Send the embed (removed reaction instructions)
-    message = await interaction.followup.send(embed=embed)
+    # Send the embed with delete button and reactions
+    message = await interaction.followup.send(embed=embed, view=DeleteJobButton(job_id))
 
     # Add reactions to the message
     await message.add_reaction("✅")
@@ -251,7 +298,7 @@ async def viewjobs(interaction: Interaction):
     data = load_jobs()
     jobs = data["jobs"]
     if not jobs:
-        await interaction.response.send_message("No available jobs.", ephemeral=True)
+        await interaction.response.send_message("There are no available jobs.", ephemeral=True)
         return
 
     total_pages = (len(jobs) + ITEMS_PER_PAGE - 1) // ITEMS_PER_PAGE  # Calculate total pages
